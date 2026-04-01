@@ -86,17 +86,57 @@ class Controller:
         return await self.wamp_state_handler.client_rpc(self.controller_uri, "self:read", *args)
 
     async def start_mouse_event_stream(self):
-        """Right now we try to send every event to the client.. we should possibly maybe debounce?"""
+        """Read spacenav events and forward them to the browser client.
+
+        Motion events are accumulated (deltas summed) and flushed only as
+        fast as the browser RPC round-trips allow.  Button events are
+        forwarded immediately.
+        """
         logging.info("Starting the mouse stream")
+        self._pending_motion: MotionEvent | None = None
+        self._motion_ready = asyncio.Event()
+
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(self._read_spacenav_events())
+            tg.create_task(self._flush_motion())
+
+    async def _read_spacenav_events(self):
         while True:
-            mouse_event = await self.reader.read(32)
-            if self.focus and self.subscribed:
-                nums = struct.unpack("iiiiiiii", mouse_event)
-                event = from_message(list(nums))
+            raw = await self.reader.read(32)
+            if not (self.focus and self.subscribed):
+                continue
+            nums = struct.unpack("iiiiiiii", raw)
+            event = from_message(list(nums))
+
+            if isinstance(event, ButtonEvent):
                 if self.client_metadata["name"] in ["Onshape", "WebThreeJS Sample"]:
                     await self.update_client(event)
                 else:
                     logging.warning("Unknown client! Cannot send mouse events, client_metadata:%s", self.client_metadata)
+            elif isinstance(event, MotionEvent):
+                pending = self._pending_motion
+                if pending is None:
+                    self._pending_motion = event
+                else:
+                    self._pending_motion = MotionEvent(
+                        x=pending.x + event.x,
+                        y=pending.y + event.y,
+                        z=pending.z + event.z,
+                        pitch=pending.pitch + event.pitch,
+                        yaw=pending.yaw + event.yaw,
+                        roll=pending.roll + event.roll,
+                        period=event.period,
+                    )
+                self._motion_ready.set()
+
+    async def _flush_motion(self):
+        while True:
+            await self._motion_ready.wait()
+            self._motion_ready.clear()
+            event = self._pending_motion
+            self._pending_motion = None
+            if event is not None and self.client_metadata["name"] in ["Onshape", "WebThreeJS Sample"]:
+                await self.update_client(event)
 
     @staticmethod
     def get_affine_pivot_matrices(model_extents):
@@ -127,10 +167,10 @@ class Controller:
         perspective = await self.remote_read("view.perspective")
         curr_affine = np.asarray(await self.remote_read("view.affine"), dtype=np.float32).reshape(4, 4)
 
-        # This (transpose of top left quadrant) is the correct way to get the rotation matrix of the camera but it is unstable.. Either of the below methods works fine though.
+        # Extract camera-to-world rotation from the view matrix (transpose of
+        # the top-left 3x3). Re-orthogonalize via SVD to counter float32 drift
+        # that accumulates over many incremental read-modify-write cycles.
         R_cam = curr_affine[:3, :3].T
-        # cam2world = np.linalg.inv(curr_affine)
-        # R_cam = cam2world[:3, :3]
         U, _, Vt = np.linalg.svd(R_cam)
         R_cam = U @ Vt
 

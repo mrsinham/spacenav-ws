@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "SpaceNav Bridge for Onshape",
+  "version": "0.1.0",
+  "description": "Enables 3Dconnexion SpaceMouse support in Onshape on Linux via spacenav-ws.",
+  "permissions": [],
+  "content_scripts": [
+    {
+      "matches": ["https://cad.onshape.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "icons": {}
+}
