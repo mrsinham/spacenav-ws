@@ -27,6 +27,10 @@ ORIGINS = [
 CERT_FILE = Path(__file__).parent / "certs" / "ip.crt"
 KEY_FILE = Path(__file__).parent / "certs" / "ip.key"
 
+# Global sensitivity, set by the serve command before uvicorn starts
+_sensitivity: float = 1.0
+_rotation_sensitivity: float = 1.0
+
 cli = typer.Typer()
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_methods=["GET", "OPTIONS"], allow_headers=["*"])
@@ -84,7 +88,7 @@ async def nlproxy(ws: WebSocket):
     """This is the websocket that webapplications should connect to for mouse data"""
     wamp_session = WampSession(ws)
     spacenav_reader, _ = await get_async_spacenav_socket_reader()
-    ctrl = await create_mouse_controller(wamp_session, spacenav_reader)
+    ctrl = await create_mouse_controller(wamp_session, spacenav_reader, _sensitivity, _rotation_sensitivity)
     # TODO, better error handling then just dropping the websocket disconnect on the floor?
     async with asyncio.TaskGroup() as tg:
         tg.create_task(ctrl.start_mouse_event_stream(), name="mouse")
@@ -92,9 +96,13 @@ async def nlproxy(ws: WebSocket):
 
 
 @cli.command()
-def serve(host: str = "127.51.68.120", port: int = 8181, hot_reload: bool = False):
+def serve(host: str = "127.51.68.120", port: int = 8181, hot_reload: bool = False, sensitivity: float = 0.3, rotation_sensitivity: float = 1.0):
     """Start the server that sends spacenav to browser based applications like onshape"""
+    global _sensitivity, _rotation_sensitivity
+    _sensitivity = sensitivity
+    _rotation_sensitivity = rotation_sensitivity
     logging.warning(f"Navigate to: https://{host}:{port} You should be prompted to add the cert as an exception to your browser!!")
+    logging.info(f"Sensitivity: {sensitivity}, rotation: {rotation_sensitivity}")
     uvicorn.run(
         "spacenav_ws.main:app", host=host, port=port, ws="auto", ssl_certfile=CERT_FILE, ssl_keyfile=KEY_FILE, log_level="info", reload=hot_reload
     )

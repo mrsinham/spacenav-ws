@@ -51,11 +51,18 @@ class Controller:
             True when this controller is in focus and should send events.
     """
 
-    def __init__(self, reader: asyncio.StreamReader, _: Mouse3d, wamp_state_handler: WampSession, client_metadata: dict):
+    # Base scaling factors (before user sensitivity multiplier)
+    BASE_ROTATION_SCALE = 0.02
+    BASE_TRANSLATION_SCALE = 0.0005
+    BASE_ZOOM_SCALE = 0.001
+
+    def __init__(self, reader: asyncio.StreamReader, _: Mouse3d, wamp_state_handler: WampSession, client_metadata: dict, sensitivity: float = 1.0, rotation_sensitivity: float = 1.0):
         self.id = "controller0"
         self.client_metadata = client_metadata
         self.reader = reader
         self.wamp_state_handler = wamp_state_handler
+        self.sensitivity = sensitivity
+        self.rotation_sensitivity = rotation_sensitivity
 
         self.wamp_state_handler.wamp.subscribe_handlers[self.controller_uri] = self.subscribe
         self.wamp_state_handler.wamp.call_handlers["wss://127.51.68.120/3dconnexion#update"] = self.client_update
@@ -159,8 +166,11 @@ class Controller:
         model_extents = await self.remote_read("model.extents")
 
         if isinstance(event, ButtonEvent):
-            await self.remote_write("view.affine", await self.remote_read("views.front"))
-            await self.remote_write("view.extents", [c * 1.2 for c in model_extents])
+            # Reset rotation to front view, but keep the current camera distance
+            curr_affine = np.asarray(await self.remote_read("view.affine"), dtype=np.float32).reshape(4, 4)
+            front = np.eye(4, dtype=np.float32)
+            front[3, :] = curr_affine[3, :]  # preserve camera position and w
+            await self.remote_write("view.affine", front.reshape(-1).tolist())
             return
 
         # 1) pull down the current extents and model matrix
@@ -174,15 +184,16 @@ class Controller:
         U, _, Vt = np.linalg.svd(R_cam)
         R_cam = U @ Vt
 
-        # 2) Seperately calculate rotation and translation matrices
-        angles = np.array([event.pitch, event.yaw, -event.roll]) * 0.02
+        # 2) Separately calculate rotation and translation matrices
+        angles = np.array([event.pitch, event.yaw, -event.roll]) * self.BASE_ROTATION_SCALE * self.rotation_sensitivity
         R_delta_cam = transform.Rotation.from_euler("xyz", angles, degrees=True).as_matrix()
         R_world = R_cam @ R_delta_cam @ R_cam.T
 
         rot_delta = np.eye(4, dtype=np.float32)
         rot_delta[:3, :3] = R_world
         trans_delta = np.eye(4, dtype=np.float32)
-        trans_delta[3, :3] = np.array([-event.x, -event.z, event.y], dtype=np.float32) * 0.0005
+        zoom_factor = self.BASE_ZOOM_SCALE / self.BASE_TRANSLATION_SCALE  # zoom scales faster than pan
+        trans_delta[3, :3] = np.array([-event.x, -event.y, -event.z * zoom_factor], dtype=np.float32) * self.BASE_TRANSLATION_SCALE * self.sensitivity
 
         # 3) Apply changes to the ModelViewProjection matrix
         pivot_pos, pivot_neg = self.get_affine_pivot_matrices(model_extents)
@@ -191,7 +202,7 @@ class Controller:
         # Write back changes and optionally update extents if the projection is orthographic!
         if not perspective:
             extents = await self.remote_read("view.extents")
-            zoom_delta = event.y * 0.0002
+            zoom_delta = -event.z * self.BASE_ZOOM_SCALE * self.sensitivity
             scale = 1.0 + zoom_delta
             new_extents = [c * scale for c in extents]
             await self.remote_write("motion", True)
@@ -201,7 +212,7 @@ class Controller:
         await self.remote_write("view.affine", new_affine.reshape(-1).tolist())
 
 
-async def create_mouse_controller(wamp_state_handler: WampSession, spacenav_reader: asyncio.StreamReader) -> Controller:
+async def create_mouse_controller(wamp_state_handler: WampSession, spacenav_reader: asyncio.StreamReader, sensitivity: float = 1.0, rotation_sensitivity: float = 1.0) -> Controller:
     """
     This takes in an active websocket wrapped in a wampsession, it consumes the first couple of messages that form a sort of pseudo handshake..
     When all is said is done it returns an active controller!
@@ -225,7 +236,7 @@ async def create_mouse_controller(wamp_state_handler: WampSession, spacenav_read
     assert isinstance(msg, Call)
     assert msg.proc_uri == "3dx_rpc:create" and msg.args[0] == "3dconnexion:3dcontroller" and msg.args[1] == mouse.id
     metadata = msg.args[2]
-    controller = Controller(spacenav_reader, mouse, wamp_state_handler, metadata)
+    controller = Controller(spacenav_reader, mouse, wamp_state_handler, metadata, sensitivity, rotation_sensitivity)
     logging.info(f'Created controller "{controller.id}" for mouse "{mouse.id}", for client "{metadata["name"]}", version "{metadata["version"]}"')
 
     await wamp_state_handler.wamp.send_message(CallResult(msg.call_id, {"instance": controller.id}))
